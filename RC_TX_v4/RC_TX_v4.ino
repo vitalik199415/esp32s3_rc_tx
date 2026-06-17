@@ -23,6 +23,69 @@
 #include <USB.h>
 #include <USBHIDGamepad.h>
 #include "config.h"
+#include "icons.h"
+
+// =============================================================================
+// TYPES — all at top (Arduino IDE preprocessor requirement)
+// =============================================================================
+
+enum RadioMode  : uint8_t { RADIO_NRF24 = 0, RADIO_ESPNOW = 1 };
+enum PktType    : uint8_t { PTYPE_DATA=0x01, PTYPE_PAIR_REQ=0x10, PTYPE_PAIR_ACK=0x11, PTYPE_PAIR_DONE=0x12, PTYPE_TELEMETRY=0x20 };
+enum PairState  : uint8_t { PAIR_IDLE, PAIR_SEARCHING, PAIR_SUCCESS, PAIR_TIMEOUT };
+
+struct TelemetryPkt {
+    PktType  type;       // PTYPE_TELEMETRY
+    int8_t   rssi;       // dBm (negative, e.g. -65)
+    uint8_t  lq;         // link quality 0-100%
+    uint16_t rxVoltage;  // mV (0 if not measured)
+    uint8_t  rxArmed;    // 1 if ARM channel > 1700
+    int8_t   rxTemp;     // reserved / future
+};
+
+struct EspNowPkt {
+    PktType type;
+    uint8_t mac[6];
+    uint8_t data[20]; // channel bytes when PTYPE_DATA
+};
+enum ModelType  : uint8_t { MODEL_AIRPLANE = 0, MODEL_CAR = 1, MODEL_HELI = 2, MODEL_DRONE = 3 };
+enum BtnEvent   : uint8_t { BTN_NONE, BTN_UP, BTN_DOWN, BTN_BACK, BTN_RIGHT, BTN_OK };
+enum CalibState : uint8_t { CALIB_IDLE, CALIB_CENTER, CALIB_EXTREME, CALIB_DONE };
+
+enum UiState : uint8_t {
+    UI_HOME = 0, UI_MENU,
+    UI_MODELS, UI_MODEL_EDIT, UI_CHANNELS, UI_AXIS_REVERSE, UI_RATES, UI_RADIO, UI_ESPNOW_PAIR,
+    UI_CALIBRATE, UI_SETTINGS, UI_TELEMETRY, UI_ABOUT
+};
+
+struct AxisCal {
+    uint16_t minVal, centre, maxVal;
+    bool     reversed;
+};
+
+struct ModelProfile {
+    char      name[16];
+    ModelType type;
+    RadioMode radioMode;
+    AxisCal   axCal[6];
+    uint8_t   espnowPeer[6];
+    // Expo: 0=linear, 1-100 = curve strength (per axis 0-3 = AIL/ELE/THR/RUD)
+    uint8_t   expo[4];
+    // Rate: 50-100% of full throw (per axis 0-3 = AIL/ELE/THR/RUD)
+    uint8_t   rate[4];
+    // TX send frequency in Hz: 25, 50, 100
+    uint8_t   txFreqHz;
+};
+
+struct BtnState {
+    uint8_t  pin;
+    bool     lastRaw, pressed;
+    uint32_t lastChange, pressStart, lastRepeat;
+};
+
+struct Setting {
+    const char* label;
+    int value, minVal, maxVal, step;
+};
 
 // =============================================================================
 // PCF8575 — using Renzo Mischianti's library
@@ -66,63 +129,6 @@ void buzzOn()   { pcfSetPin(PCF_BUZZER, true);  }
 void buzzOff()  { pcfSetPin(PCF_BUZZER, false); }
 void vibroOn()  { pcfSetPin(PCF_VIBRO,  true);  }
 void vibroOff() { pcfSetPin(PCF_VIBRO,  false); }
-
-// =============================================================================
-// TYPES — all at top (Arduino IDE preprocessor requirement)
-// =============================================================================
-
-enum RadioMode  : uint8_t { RADIO_NRF24 = 0, RADIO_ESPNOW = 1 };
-enum PktType    : uint8_t { PTYPE_DATA=0x01, PTYPE_PAIR_REQ=0x10, PTYPE_PAIR_ACK=0x11, PTYPE_PAIR_DONE=0x12, PTYPE_TELEMETRY=0x20 };
-enum PairState  : uint8_t { PAIR_IDLE, PAIR_SEARCHING, PAIR_SUCCESS, PAIR_TIMEOUT };
-
-struct TelemetryPkt {
-    PktType  type;       // PTYPE_TELEMETRY
-    int8_t   rssi;       // dBm (negative, e.g. -65)
-    uint8_t  lq;         // link quality 0-100%
-    uint16_t rxVoltage;  // mV (0 if not measured)
-    uint8_t  rxArmed;    // 1 if ARM channel > 1700
-    int8_t   rxTemp;     // reserved / future
-};
-
-struct EspNowPkt {
-    PktType type;
-    uint8_t mac[6];
-    uint8_t data[20]; // channel bytes when PTYPE_DATA
-};
-enum ModelType  : uint8_t { MODEL_AIRPLANE = 0, MODEL_CAR = 1, MODEL_HELI = 2, MODEL_DRONE = 3 };
-enum BtnEvent   : uint8_t { BTN_NONE, BTN_UP, BTN_DOWN, BTN_BACK, BTN_RIGHT, BTN_OK };
-enum CalibState : uint8_t { CALIB_IDLE, CALIB_CENTER, CALIB_EXTREME, CALIB_DONE };
-
-enum UiState : uint8_t {
-    UI_HOME = 0, UI_MENU,
-    UI_MODELS, UI_MODEL_EDIT, UI_CHANNELS, UI_AXIS_REVERSE, UI_RATES, UI_RADIO, UI_ESPNOW_PAIR,
-    UI_CALIBRATE, UI_SETTINGS, UI_TELEMETRY, UI_ABOUT
-};
-
-struct ModelProfile {
-    char      name[16];
-    ModelType type;
-    RadioMode radioMode;
-    AxisCal   axCal[6];
-    uint8_t   espnowPeer[6];
-    // Expo: 0=linear, 1-100 = curve strength (per axis 0-3 = AIL/ELE/THR/RUD)
-    uint8_t   expo[4];
-    // Rate: 50-100% of full throw (per axis 0-3 = AIL/ELE/THR/RUD)
-    uint8_t   rate[4];
-    // TX send frequency in Hz: 25, 50, 100
-    uint8_t   txFreqHz;
-};
-
-struct BtnState {
-    uint8_t  pin;
-    bool     lastRaw, pressed;
-    uint32_t lastChange, pressStart, lastRepeat;
-};
-
-struct Setting {
-    const char* label;
-    int value, minVal, maxVal, step;
-};
 
 // =============================================================================
 // FORWARD DECLARATIONS
@@ -277,11 +283,6 @@ const uint8_t RX_ADDR[6] = "RC_RX";
 // =============================================================================
 // ADC INPUT
 // =============================================================================
-struct AxisCal {
-    uint16_t minVal, centre, maxVal;
-    bool     reversed;
-};
-
 const uint8_t adcPins[6] = {
     PIN_JOY_RX, PIN_JOY_RY, PIN_JOY_LY, PIN_JOY_LX, PIN_POT_A, PIN_POT_B
 };
@@ -1981,28 +1982,8 @@ void setup() {
     Serial.println("[INIT] Display OK");
 
     // Boot animation — expanding frame + title fade-in
-    for (uint8_t step = 0; step < 5; step++) {
-        display->clearBuffer();
-        uint8_t margin = (4 - step) * 12;
-        display->drawFrame(margin, margin, 128 - margin*2, 64 - margin*2);
-        if (step >= 2) {
-            display->setFont(u8g2_font_6x10_tr);
-            uint8_t tw = display->getStrWidth("RC Transmitter");
-            display->drawStr((128-tw)/2, 28, "RC Transmitter");
-        }
-        if (step >= 3) {
-            display->setFont(u8g2_font_5x7_tr);
-            display->drawStr(55, 40, "v3.1");
-        }
-        if (step == 4) {
-            display->setFont(u8g2_font_5x7_tr);
-            uint8_t mw = display->getStrWidth(models[activeModel].name);
-            display->drawStr((128-mw)/2, 54, models[activeModel].name);
-        }
-        display->sendBuffer();
-        delay(180);
-    }
-    delay(300);
+    display->drawXBMP(0, 0, 128, 64, icon_logo);
+    delay(1000);
 
     ina219 = new Adafruit_INA219(INA219_ADDR);
     inaOk  = ina219->begin();

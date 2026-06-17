@@ -1,4 +1,4 @@
 ﻿*
-!RC_TX_v4
-!rc_receiver_espnow
+!RC_TX_v4/*
+!rc_receiver_espnow/*
 !.gitignore
