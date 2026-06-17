@@ -7,7 +7,7 @@
 // !! PSRAM pins 35, 36, 37 MUST NOT be used on N16R8 — causes TG1WDT crash !!
 // =============================================================================
 
-#define FW_VERSION   "3.0.0"
+#define FW_VERSION   "4.0.0"
 #define MODEL_NAME   "Model 1"
 
 // ── I2C ───────────────────────────────────────────────────────────────────────
@@ -61,16 +61,14 @@
 // 17 18 20 21 39 40 41 42 46 47 48
 
 // ── Outputs ───────────────────────────────────────────────────────────────────
-// PIN_LED_GREEN removed — GPIO 16 repurposed for LCD_CS
-#define PIN_BUZZER      19
-#define PIN_LCD_BL      20   // backlight PWM — GPIO 20 (freed from SW_RTH via PCF8575)
+#define PIN_LCD_BL      20   // backlight PWM — GPIO 20
 
 // ── Display GMG12864-06D (ST7565R, SPI) ──────────────────────────────────────
 // Shares SPI bus with nRF24 (MOSI=GPIO7, SCK=GPIO9)
 // CS and DC repurposed from LED_GREEN and LCD_BL
-#define PIN_LCD_CS      16   // SPI chip select (was LED_GREEN)
-#define PIN_LCD_DC      45   // data/command (was LCD_BL)
-// RST: tie to 3.3V on display module (no software reset)
+#define PIN_LCD_CS      16   // SPI chip select 
+#define PIN_LCD_DC      45   // data/command
+// RST: tie to 3.3V on display module 
 #define LCD_CONTRAST    58   // ST7565R: start at 58 (0x3A), tune if too dim/dark
 
 // ── INA219 ────────────────────────────────────────────────────────────────────
