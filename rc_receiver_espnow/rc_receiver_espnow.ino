@@ -98,6 +98,19 @@ struct EspNowPkt {
     uint8_t mac[6];
     uint8_t data[20];
 };
+// Pairing packets only send type+mac, not the unused data[20] field
+#define PAIR_PKT_SIZE (sizeof(PktType) + 6)
+
+// Shared channel-data struct — MUST be byte-identical to TX definition.
+// Copy-paste this block from TX if either side is ever modified.
+struct __attribute__((packed)) ChannelPkt {
+    uint16_t channels[10]; // CH1-CH10, raw microsecond values 1000-2000
+};
+
+struct __attribute__((packed)) EspNowDataPkt {
+    PktType    type;       // always PTYPE_DATA
+    ChannelPkt ch;
+};
 
 // =============================================================================
 // GLOBAL STATE
@@ -243,7 +256,7 @@ void sendPairAck(const uint8_t* toMac) {
         peer.encrypt = false;
         esp_now_add_peer(&peer);
     }
-    esp_now_send(toMac, (uint8_t*)&pkt, 7);
+    esp_now_send(toMac, (uint8_t*)&pkt, PAIR_PKT_SIZE);
     Serial.println("[RX] Sent PAIR_ACK");
 }
 
@@ -266,7 +279,7 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* rawData, int len) {
             txMac[0],txMac[1],txMac[2],txMac[3],txMac[4],txMac[5]);
         ledFlash(3, 150, 100);
 
-    } else if (type == PTYPE_DATA && len >= 21) {
+    } else if (type == PTYPE_DATA && len >= (int)sizeof(EspNowDataPkt)) {
         // Track RSSI from packet metadata
         lastRssi = (int8_t)info->rx_ctrl->rssi;
         pktCount++;
@@ -275,8 +288,9 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* rawData, int len) {
             for (int i = 0; i < 6; i++)
                 if (info->src_addr[i] != txMac[i]) return;
         }
-        for (int i = 0; i < 10; i++)
-            chData[i] = ((uint16_t)rawData[1 + i*2] << 8) | rawData[2 + i*2];
+        // Struct cast — no manual byte unpacking, guaranteed to match TX layout
+        const EspNowDataPkt* pkt = (const EspNowDataPkt*)rawData;
+        for (int i = 0; i < 10; i++) chData[i] = pkt->ch.channels[i];
         lastPktMs = millis();
         rxState   = RX_NORMAL;
     }

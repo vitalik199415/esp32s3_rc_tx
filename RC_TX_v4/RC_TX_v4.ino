@@ -47,6 +47,21 @@ struct EspNowPkt {
     uint8_t mac[6];
     uint8_t data[20]; // channel bytes when PTYPE_DATA
 };
+// Pairing packets only send type+mac, not the unused data[20] field
+#define PAIR_PKT_SIZE (sizeof(PktType) + 6)
+
+// Shared channel-data struct — MUST be byte-identical on TX and RX.
+// Used as the raw nRF24 payload (no type byte needed — nRF24 only ever
+// carries channel data on its dedicated pipe) and wrapped with a PktType
+// byte for ESP-NOW (which multiplexes DATA/PAIR/TELEMETRY on one callback).
+struct __attribute__((packed)) ChannelPkt {
+    uint16_t channels[10]; // CH1-CH10, raw microsecond values 1000-2000
+};
+
+struct __attribute__((packed)) EspNowDataPkt {
+    PktType    type;       // always PTYPE_DATA
+    ChannelPkt ch;
+};
 enum ModelType  : uint8_t { MODEL_AIRPLANE = 0, MODEL_CAR = 1, MODEL_HELI = 2, MODEL_DRONE = 3 };
 enum BtnEvent   : uint8_t { BTN_NONE, BTN_UP, BTN_DOWN, BTN_BACK, BTN_RIGHT, BTN_OK };
 enum CalibState : uint8_t { CALIB_IDLE, CALIB_CENTER, CALIB_EXTREME, CALIB_DONE };
@@ -272,7 +287,24 @@ uint8_t   espnowPeer[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 // Apply active model settings
 void modelApply() {
     switchRadioMode(models[activeModel].radioMode);
-    memcpy(models[activeModel].espnowPeer, espnowPeer, 6);
+    // Load THIS model's saved peer MAC into the active global — not the
+    // other way around. Previously this was reversed, which silently
+    // overwrote each model's saved receiver with whatever the global
+    // happened to hold (broadcast FF:FF:FF:FF:FF:FF on boot, or leftover
+    // from whichever model was active before).
+    memcpy(espnowPeer, models[activeModel].espnowPeer, 6);
+
+    // Re-register the ESP-NOW peer with the now-correct MAC.
+    // Skipped on the very first call during setup() since ESP-NOW isn't
+    // initialized yet; espnowInit() will register the peer itself using
+    // this freshly-loaded espnowPeer value.
+    if (espnowOk) {
+        if (esp_now_is_peer_exist(espnowPeer)) esp_now_del_peer(espnowPeer);
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, espnowPeer, 6);
+        peer.channel = ESPNOW_CHANNEL; peer.encrypt = false;
+        esp_now_add_peer(&peer);
+    }
 }
 
 const char* radioModeName() { return radioMode == RADIO_NRF24 ? "nRF24" : "ESP-NOW"; }
@@ -525,9 +557,9 @@ bool nrfInit() {
 
 void nrfSend() {
     if (!nrfOk || radioMode != RADIO_NRF24) return;
-    uint8_t p[RF_PAYLOAD_SIZE];
-    for (int i = 0; i < 10; i++) { p[i*2]=channels[i]>>8; p[i*2+1]=channels[i]&0xFF; }
-    bool ok = radio->write(p, RF_PAYLOAD_SIZE);
+    ChannelPkt pkt;
+    for (int i = 0; i < 10; i++) pkt.channels[i] = channels[i];
+    bool ok = radio->write(&pkt, sizeof(ChannelPkt));
     static uint8_t lq[10]={0}; static uint8_t li=0;
     lq[li++%10] = ok?10:0;
     uint16_t s=0; for(int i=0;i<10;i++) s+=lq[i];
@@ -582,7 +614,7 @@ void onPairAckReceived(const uint8_t* mac) {
     pkt.type = PTYPE_PAIR_DONE;
     uint8_t selfMac[6]; esp_read_mac(selfMac, ESP_MAC_WIFI_STA);
     memcpy(pkt.mac, selfMac, 6);
-    esp_now_send(mac, (uint8_t*)&pkt, 7);
+    esp_now_send(mac, (uint8_t*)&pkt, PAIR_PKT_SIZE);
     pairState = PAIR_SUCCESS;
     modelsSave();
     beep(3, 60, 40);
@@ -605,9 +637,10 @@ bool espnowInit() {
 
 void espnowSend() {
     if (!espnowOk || radioMode != RADIO_ESPNOW) return;
-    uint8_t p[RF_PAYLOAD_SIZE];
-    for (int i=0;i<10;i++){p[i*2]=channels[i]>>8;p[i*2+1]=channels[i]&0xFF;}
-    esp_now_send(espnowPeer, p, RF_PAYLOAD_SIZE);
+    EspNowDataPkt pkt;
+    pkt.type = PTYPE_DATA;
+    for (int i=0;i<10;i++) pkt.ch.channels[i] = channels[i];
+    esp_now_send(espnowPeer, (uint8_t*)&pkt, sizeof(EspNowDataPkt));
     linkQuality=espnowSendOk?100:0; radioLinked=espnowSendOk;
 }
 
@@ -637,7 +670,7 @@ void pairingTick() {
     uint8_t selfMac[6]; esp_read_mac(selfMac, ESP_MAC_WIFI_STA);
     memcpy(pkt.mac, selfMac, 6);
     uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    esp_now_send(broadcast, (uint8_t*)&pkt, 7);
+    esp_now_send(broadcast, (uint8_t*)&pkt, PAIR_PKT_SIZE);
 }
 
 void switchRadioMode(RadioMode m) {
@@ -1912,9 +1945,11 @@ void setup() {
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
 
+
     // Load settings and models from NVS
     modelsDefault();
     modelsLoad();
+    modelApply(); // load active model's saved ESP-NOW peer MAC before espnowInit() runs
     loadSettings();
     ledcWrite(PIN_LCD_BL, settings[1].value);
     radioMode = models[activeModel].radioMode;
