@@ -22,6 +22,7 @@
 #include <esp_mac.h>
 #include <USB.h>
 #include <USBHIDGamepad.h>
+#include <esp_task_wdt.h>
 #include "config.h"
 #include "icons.h"
 
@@ -55,6 +56,9 @@ struct EspNowPkt {
 // carries channel data on its dedicated pipe) and wrapped with a PktType
 // byte for ESP-NOW (which multiplexes DATA/PAIR/TELEMETRY on one callback).
 struct __attribute__((packed)) ChannelPkt {
+    uint8_t  seq;           // increments every packet, wraps 0-255 — lets RX
+                             // detect dropped packets (gap in sequence) vs.
+                             // just slow/late arrival.
     uint16_t channels[10]; // CH1-CH10, raw microsecond values 1000-2000
 };
 
@@ -63,6 +67,15 @@ struct __attribute__((packed)) EspNowDataPkt {
     ChannelPkt ch;
 };
 enum ModelType  : uint8_t { MODEL_AIRPLANE = 0, MODEL_CAR = 1, MODEL_HELI = 2, MODEL_DRONE = 3 };
+// Simple fixed-wing mixer presets. Mixing happens entirely on TX — the RX
+// just outputs whatever value lands in each channel slot, unaware mixing
+// happened. NONE = passthrough (default for all non-fixed-wing models).
+// ELEVON   : combines Aileron+Elevator stick into CH1/CH2 (elevonL/elevonR)
+// VTAIL    : combines Elevator+Rudder stick into CH2/CH4 (ruddervatorL/R)
+// FLAPERON : combines Aileron stick + Pot A (flap slider) into CH1/CH6
+//            (aileronL/aileronR) — repurposes the Camera channel slot (CH6)
+//            as the second aileron output for models using this mixer.
+enum MixerType  : uint8_t { MIXER_NONE = 0, MIXER_ELEVON = 1, MIXER_VTAIL = 2, MIXER_FLAPERON = 3 };
 enum BtnEvent   : uint8_t { BTN_NONE, BTN_UP, BTN_DOWN, BTN_BACK, BTN_RIGHT, BTN_OK };
 enum CalibState : uint8_t { CALIB_IDLE, CALIB_CENTER, CALIB_EXTREME, CALIB_DONE };
 
@@ -89,6 +102,7 @@ struct ModelProfile {
     uint8_t   rate[4];
     // TX send frequency in Hz: 25, 50, 100
     uint8_t   txFreqHz;
+    MixerType mixerType; // fixed-wing mixer preset — see MixerType enum above
 };
 
 struct BtnState {
@@ -100,6 +114,7 @@ struct BtnState {
 struct Setting {
     const char* label;
     int value, minVal, maxVal, step;
+    uint8_t divisor; // 1 = show as integer, 10 = one decimal place (value/10.0)
 };
 
 // =============================================================================
@@ -178,10 +193,33 @@ void channelsInit() {
 // =============================================================================
 bool  inaOk = false;
 float battVoltage = 0, battCurrent = 0, battPower = 0;
+// Configurable battery thresholds — defaults from config.h, adjustable via Settings
+float battWarnV = BATT_WARN_V;
+float battCritV = BATT_CRIT_V;
+
+// Flight timer — counts up while ARM channel is active, resets to zero on disarm
+uint32_t flightTimerStartMs   = 0;
+uint32_t flightTimerElapsedMs = 0; // current run duration, ms — 0 when disarmed
+bool     flightTimerRunning   = false;
+
+void flightTimerTick() {
+    bool armed = channels[6] > 1700;
+    uint32_t now = millis();
+    if (armed && !flightTimerRunning) {
+        flightTimerRunning = true;
+        flightTimerStartMs = now;
+    } else if (!armed && flightTimerRunning) {
+        flightTimerRunning   = false;
+        flightTimerElapsedMs = 0; // reset on disarm
+    }
+    if (flightTimerRunning) {
+        flightTimerElapsedMs = now - flightTimerStartMs;
+    }
+}
 
 uint8_t battPercent() {
     return (uint8_t)(constrain(
-        (battVoltage - BATT_CRIT_V) / (BATT_FULL_V - BATT_CRIT_V), 0.f, 1.f) * 100);
+        (battVoltage - battCritV) / (BATT_FULL_V - battCritV), 0.f, 1.f) * 100);
 }
 
 // =============================================================================
@@ -206,7 +244,8 @@ void modelsDefault() {
         }
         models[m].axCal[1].reversed = true;
         for (int i = 0; i < 4; i++) { models[m].expo[i] = 0; models[m].rate[i] = 100; }
-        models[m].txFreqHz = 50;
+        models[m].txFreqHz  = 50;
+        models[m].mixerType = MIXER_NONE;
     }
 }
 
@@ -320,10 +359,24 @@ const uint8_t adcPins[6] = {
 };
 const int chMap[6] = { 0, 1, 2, 3, 8, 9 };
 
+// EMA (exponential moving average) filter — one ADC read per call instead
+// of ADC_SAMPLES blocking reads, with smoothing equivalent via persistent state.
+// alpha=0.3 gives similar settling behaviour to an 8-sample average but with
+// 1/8th the blocking time per call.
+static uint16_t emaState[6] = {0,0,0,0,0,0}; // indexed same as adcPins[]
+static bool     emaInit[6]  = {false,false,false,false,false,false};
+
 uint16_t readADCSmooth(uint8_t pin) {
-    uint32_t s = 0;
-    for (int i = 0; i < ADC_SAMPLES; i++) s += analogRead(pin);
-    return s / ADC_SAMPLES;
+    // Find which axis slot this pin belongs to (adcPins[] is small, linear scan is fine)
+    uint8_t idx = 0;
+    for (uint8_t i = 0; i < 6; i++) if (adcPins[i] == pin) { idx = i; break; }
+
+    uint16_t raw = analogRead(pin);
+    if (!emaInit[idx]) { emaState[idx] = raw; emaInit[idx] = true; return raw; }
+
+    const float ALPHA = 0.3f;
+    emaState[idx] = (uint16_t)(ALPHA * raw + (1.0f - ALPHA) * emaState[idx]);
+    return emaState[idx];
 }
 
 uint16_t adcToUs(uint16_t raw, const AxisCal& cal) {
@@ -372,6 +425,41 @@ void readAnalog() {
             us   = applyRate(us, m.rate[i]);
         }
         channels[chMap[i]] = us;
+    }
+    applyMixer(m.mixerType);
+}
+
+// Simple fixed-wing mixer presets. Runs after readAnalog() has populated
+// channels[0..3] (AIL/ELE/THR/RUD, post-expo/rate) and channels[8..9]
+// (PotA/PotB). Overwrites specific channel slots in-place with mixed
+// values — the RX has no awareness this happened, it just outputs
+// whatever value lands in each slot.
+void applyMixer(MixerType mix) {
+    if (mix == MIXER_NONE) return;
+
+    auto norm  = [](uint16_t us) -> float { return (us - (float)CH_MID) / 500.0f; };
+    auto toUs  = [](float n) -> uint16_t {
+        n = constrain(n, -1.0f, 1.0f);
+        return (uint16_t)(CH_MID + n * 500.0f);
+    };
+
+    if (mix == MIXER_ELEVON) {
+        float ail = norm(channels[0]); // CH1 input
+        float ele = norm(channels[1]); // CH2 input
+        channels[0] = toUs(ele + ail); // elevonL -> CH1
+        channels[1] = toUs(ele - ail); // elevonR -> CH2
+
+    } else if (mix == MIXER_VTAIL) {
+        float ele = norm(channels[1]); // CH2 input
+        float rud = norm(channels[3]); // CH4 input
+        channels[1] = toUs(ele + rud); // ruddervatorL -> CH2
+        channels[3] = toUs(ele - rud); // ruddervatorR -> CH4
+
+    } else if (mix == MIXER_FLAPERON) {
+        float ail  = norm(channels[0]); // CH1 input
+        float flap = norm(channels[8]); // PotA (CH9) as flap slider
+        channels[0] = toUs(ail + flap); // aileronL  -> CH1
+        channels[5] = toUs(-ail + flap); // aileronR -> CH6 (Camera slot repurposed)
     }
 }
 
@@ -557,7 +645,9 @@ bool nrfInit() {
 
 void nrfSend() {
     if (!nrfOk || radioMode != RADIO_NRF24) return;
+    static uint8_t txSeq = 0;
     ChannelPkt pkt;
+    pkt.seq = txSeq++;
     for (int i = 0; i < 10; i++) pkt.channels[i] = channels[i];
     bool ok = radio->write(&pkt, sizeof(ChannelPkt));
     static uint8_t lq[10]={0}; static uint8_t li=0;
@@ -637,11 +727,22 @@ bool espnowInit() {
 
 void espnowSend() {
     if (!espnowOk || radioMode != RADIO_ESPNOW) return;
+    static uint8_t  espTxSeq = 0;
+    static uint8_t  espLq[10] = {0};
+    static uint8_t  espLi     = 0;
+
     EspNowDataPkt pkt;
-    pkt.type = PTYPE_DATA;
+    pkt.type     = PTYPE_DATA;
+    pkt.ch.seq   = espTxSeq++;
     for (int i=0;i<10;i++) pkt.ch.channels[i] = channels[i];
     esp_now_send(espnowPeer, (uint8_t*)&pkt, sizeof(EspNowDataPkt));
-    linkQuality=espnowSendOk?100:0; radioLinked=espnowSendOk;
+
+    // Smoothed link quality — same rolling-window approach as nRF24,
+    // instead of a raw binary 100/0 per send which jumped around a lot.
+    espLq[espLi++ % 10] = espnowSendOk ? 10 : 0;
+    uint16_t sum = 0; for (int i=0;i<10;i++) sum += espLq[i];
+    linkQuality = sum;
+    radioLinked = linkQuality > 50;
 }
 
 void pairingStart() {
@@ -783,15 +884,19 @@ void simSend() {
 // SETTINGS PERSISTENCE
 // =============================================================================
 Setting settings[] = {
-    { "Contrast",   58, 0, 255, 5 },  // ST7565R: 58 default, tune as needed
-    { "Backlight", 200, 0, 255, 5 },
+    { "Contrast",   58,  0, 255, 5,  1 },  // ST7565R: 58 default, tune as needed
+    { "Backlight", 200,  0, 255, 5,  1 },
+    { "Batt Warn",  70, 50,  84, 1, 10 },  // deci-volts: 70 = 7.0V
+    { "Batt Crit",  66, 48,  80, 1, 10 },  // deci-volts: 66 = 6.6V
 };
-const uint8_t SETTINGS_COUNT = 2;
+const uint8_t SETTINGS_COUNT = 4;
 
 void saveSettings() {
     prefs.begin("rc_settings", false);
     prefs.putInt("contrast",  settings[0].value);
     prefs.putInt("backlight", settings[1].value);
+    prefs.putInt("battWarn",  settings[2].value);
+    prefs.putInt("battCrit",  settings[3].value);
     prefs.putUChar("radioMode", (uint8_t)radioMode);
     prefs.end();
     modelsSave(); // also save models when settings change
@@ -801,13 +906,28 @@ void loadSettings() {
     prefs.begin("rc_settings", true);
     settings[0].value = prefs.getInt("contrast",  255);
     settings[1].value = prefs.getInt("backlight", 200);
+    settings[2].value = prefs.getInt("battWarn",  (int)(BATT_WARN_V * 10));
+    settings[3].value = prefs.getInt("battCrit",  (int)(BATT_CRIT_V * 10));
     radioMode = (RadioMode)prefs.getUChar("radioMode", 0);
     prefs.end();
+    battWarnV = settings[2].value / 10.0f;
+    battCritV = settings[3].value / 10.0f;
 }
 
 void applySetting(uint8_t idx) {
     if (idx == 0) display->setContrast(settings[0].value);
     if (idx == 1) ledcWrite(PIN_LCD_BL, settings[1].value);
+    if (idx == 2) battWarnV = settings[2].value / 10.0f;
+    if (idx == 3) battCritV = settings[3].value / 10.0f;
+    // Keep warn >= crit + 0.2V so the two thresholds can't cross/invert
+    if (idx == 2 && settings[2].value <= settings[3].value + 2) {
+        settings[2].value = settings[3].value + 2;
+        battWarnV = settings[2].value / 10.0f;
+    }
+    if (idx == 3 && settings[3].value >= settings[2].value - 2) {
+        settings[3].value = settings[2].value - 2;
+        battCritV = settings[3].value / 10.0f;
+    }
     saveSettings();
 }
 
@@ -876,7 +996,8 @@ bool    settingEditMode = false;
 uint8_t editModelIdx  = 0;   // which model slot we're editing
 uint8_t editField     = 0;   // 0=name, 1=type
 bool    editFieldMode = false; // true = editing value, false = selecting field
-uint8_t nameCursor    = 0;   // char position in name
+uint8_t nameCursor    = 0;
+bool    axisReverseDirty = false; // tracks unsaved axis-reverse toggles   // char position in name
 // Character set for name editing
 const char CHARSET[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
 const uint8_t CHARSET_LEN = sizeof(CHARSET) - 1;
@@ -1040,6 +1161,20 @@ void drawHome() {
         display->drawBox(pos, HY+1, 3, HH-2);
     }
 
+    // ── FLIGHT TIMER — fits the unused gap between rudder and aileron bars
+    // (x=50..77, y=56..63, ~28px wide). Shows MM:SS, counts up while armed,
+    // resets to 0:00 on disarm.
+    {
+        uint32_t totalSec = flightTimerElapsedMs / 1000;
+        uint8_t  mins = totalSec / 60;
+        uint8_t  secs = totalSec % 60;
+        char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%d:%02d", mins, secs);
+        display->setFont(u8g2_font_5x7_tr);
+        uint8_t tw = display->getStrWidth(tbuf);
+        // Centre in the 50..77 gap (width 27, centre x=63)
+        display->drawStr(63 - tw/2, 62, tbuf);
+    }
+
     // ── AILERON — horizontal dot slider ──────────────────────────────────────
     display->drawFrame(78, HY, HW, HH);
     for (uint8_t xx = 80; xx < 127; xx += 2) display->drawPixel(xx, HY+HH/2);
@@ -1118,7 +1253,7 @@ void drawHome() {
     }
 
     // ── WARNINGS (overlay, highest priority) ─────────────────────────────────
-    if (battVoltage > 0.1f && battVoltage < BATT_CRIT_V) {
+    if (battVoltage > 0.1f && battVoltage < battCritV) {
         display->drawBox(4, 56, 70, 7);
         display->setDrawColor(0);
         display->drawStr(5, 62, "LOW BATTERY!");
@@ -1497,7 +1632,11 @@ void drawSettings() {
             }
         }
         display->drawStr(12,y,settings[i].label);
-        char v[8]; snprintf(v,sizeof(v),"%d",settings[i].value);
+        char v[8];
+        if (settings[i].divisor > 1)
+            snprintf(v,sizeof(v),"%.1f",settings[i].value / (float)settings[i].divisor);
+        else
+            snprintf(v,sizeof(v),"%d",settings[i].value);
         display->drawStr(70,y,v);
         display->setDrawColor(1);
         float pct=(float)(settings[i].value-settings[i].minVal)/
@@ -1638,11 +1777,28 @@ void drawModelEdit() {
     }
     display->setDrawColor(1);
 
+    // ── Mixer field ───────────────────────────────────────────────────────────
+    bool mixerSel = (editField == 2);
+    if (mixerSel && !editFieldMode) {
+        display->drawBox(0, 39, 128, 11);
+        display->setDrawColor(0);
+    }
+    display->drawStr(2, 48, "Mixer:");
+    if (mixerSel && editFieldMode) {
+        display->drawStr(40, 48, " ");
+        display->drawStr(48, 48, mixerTypeNames[m.mixerType]);
+        uint8_t mw = display->getStrWidth(mixerTypeNames[m.mixerType]);
+        display->drawStr(50+mw, 48, " x");
+    } else {
+        display->drawStr(42, 48, mixerTypeNames[m.mixerType]);
+    }
+    display->setDrawColor(1);
+
     // ── Hint ─────────────────────────────────────────────────────────────────
     display->setFont(u8g2_font_4x6_tr);
     if (editFieldMode && editField == 0) {
         display->drawStr(2, 63, " char  Rt next  OK done");
-    } else if (editFieldMode && editField == 1) {
+    } else if (editFieldMode && (editField == 1 || editField == 2)) {
         display->drawStr(2, 63, " change   OK/Back done");
     } else {
         display->drawStr(2, 63, " select  OK edit  Back save");
@@ -1725,6 +1881,7 @@ void handleInput(BtnEvent evt) {
                     models[modelCursor].axCal[1].reversed=true;
                     for (int i=0;i<4;i++){models[modelCursor].expo[i]=0;models[modelCursor].rate[i]=100;}
                     models[modelCursor].txFreqHz=50;
+                    models[modelCursor].mixerType=MIXER_NONE;
                     if (activeModel==modelCursor) activeModel=0;
                     modelsSave(); beep(3,30,30);
                     downHeld=false;
@@ -1745,18 +1902,19 @@ void handleInput(BtnEvent evt) {
 
         case UI_MODEL_EDIT: {
             ModelProfile& em = models[editModelIdx];
+            const uint8_t EDIT_FIELD_COUNT = 3; // Name, Type, Mixer
             if (!editFieldMode) {
                 // Field selection mode
-                if (evt==BTN_UP)   editField = (editField + 2 - 1) % 2;
-                if (evt==BTN_DOWN) editField = (editField + 1) % 2;
+                if (evt==BTN_UP)   editField = (editField + EDIT_FIELD_COUNT - 1) % EDIT_FIELD_COUNT;
+                if (evt==BTN_DOWN) editField = (editField + 1) % EDIT_FIELD_COUNT;
                 if (evt==BTN_OK) {
                     editFieldMode = true;
                     if (editField == 0) nameCursor = strlen(em.name);
                     beep(1,30,0);
                 }
                 if (evt==BTN_BACK) {
-                    // Save and go back
-                    modelsSave();
+                    // Save only the edited slot, not all 4 — cheaper NVS write
+                    modelSaveSlot(editModelIdx);
                     beep(1,60,0);
                     uiState = UI_MODELS;
                 }
@@ -1785,12 +1943,22 @@ void handleInput(BtnEvent evt) {
                         editFieldMode = false;
                         beep(1,30,0);
                     }
-                } else {
+                } else if (editField == 1) {
                     // Type editing
                     if (evt==BTN_UP || evt==BTN_RIGHT)
                         em.type = (ModelType)((em.type + 1) % 4);
                     if (evt==BTN_DOWN)
                         em.type = (ModelType)((em.type + 2) % 4);
+                    if (evt==BTN_OK || evt==BTN_BACK) {
+                        editFieldMode = false;
+                        beep(1,30,0);
+                    }
+                } else {
+                    // Mixer editing — cycles None/Elevon/V-Tail/Flaperon
+                    if (evt==BTN_UP || evt==BTN_RIGHT)
+                        em.mixerType = (MixerType)((em.mixerType + 1) % 4);
+                    if (evt==BTN_DOWN)
+                        em.mixerType = (MixerType)((em.mixerType + 3) % 4);
                     if (evt==BTN_OK || evt==BTN_BACK) {
                         editFieldMode = false;
                         beep(1,30,0);
@@ -1810,10 +1978,14 @@ void handleInput(BtnEvent evt) {
             if (evt==BTN_OK) {
                 models[activeModel].axCal[settingCursor].reversed =
                     !models[activeModel].axCal[settingCursor].reversed;
-                modelsSave();
+                // Only mark dirty here — actual NVS write happens once on exit (Back)
+                axisReverseDirty = true;
                 beep(1,30,0);
             }
-            if (evt==BTN_BACK) { modelsSave(); uiState=UI_MENU; }
+            if (evt==BTN_BACK) {
+                if (axisReverseDirty) { modelSaveActive(); axisReverseDirty = false; }
+                uiState=UI_MENU;
+            }
             break;
 
         case UI_RATES: {
@@ -1938,7 +2110,18 @@ void handleInput(BtnEvent evt) {
 void setup() {
     Serial.begin(115200);
     delay(500); // brief pause for Serial Monitor to attach
+
+    // Watchdog — catches firmware lockups (e.g. I2C/SPI hang) and reboots
+    // instead of leaving the TX frozen mid-flight.
+    esp_task_wdt_config_t wdtConfig = {
+        .timeout_ms     = 3000,
+        .idle_core_mask = 0,
+        .trigger_panic  = true
+    };
+    esp_task_wdt_init(&wdtConfig);
+    esp_task_wdt_add(NULL);
     Serial.println("\n=== RC Transmitter v3.1 ===");
+
 
     ledcAttach(PIN_LCD_BL, 5000, 8);
 
@@ -1999,6 +2182,30 @@ void setup() {
     USB.begin();
 
     channelsInit();
+
+    // Throttle-low startup safety check — refuse to leave the boot screen
+    // normally if throttle stick is not at minimum. Prevents an accidental
+    // high-throttle arm immediately after power-on.
+    readAnalog();
+    if (channels[2] > (CH_THROTTLE_MIN + 100)) {
+        display->clearBuffer();
+        display->setFont(u8g2_font_6x10_tr);
+        display->drawStr(4, 24, "THROTTLE NOT");
+        display->drawStr(4, 38, "AT MINIMUM!");
+        display->setFont(u8g2_font_5x7_tr);
+        display->drawStr(4, 54, "Lower stick to continue");
+        display->sendBuffer();
+        Serial.println("[SAFETY] Throttle high at boot — waiting for minimum");
+        while (true) {
+            readAnalog();
+            esp_task_wdt_reset();
+            if (channels[2] <= (CH_THROTTLE_MIN + 100)) break;
+            beep(1, 100, 0);
+            delay(400); // intentional — safety gate, not a hot path
+        }
+        Serial.println("[SAFETY] Throttle confirmed low — continuing boot");
+    }
+
     beep(2); // non-blocking — continues via buzzTick() in loop
     ledOn();
     Serial.printf("[INIT] Ready — Model:%s  Radio:%s  Heap:%luKB\n",
@@ -2034,6 +2241,7 @@ void loop() {
         tInput=now;
         pcfRead();
         readSwitches();
+        flightTimerTick(); // depends on fresh ARM channel state from readSwitches()
     }
 
     // ADC read at 50Hz (20ms) — no need to be faster
@@ -2061,11 +2269,17 @@ void loop() {
             float v=ina219->getBusVoltage_V()+(ina219->getShuntVoltage_mV()/1000.f);
             float c=ina219->getCurrent_mA()/1000.f;
             float p=ina219->getPower_mW()/1000.f;
-            if (v>0.1f) { battVoltage=v; battCurrent=c; battPower=p; }
+            if (v>0.1f) {
+                // EMA smoothing — avoids jumpy readings from instantaneous current draw spikes
+                const float BATT_ALPHA = 0.2f;
+                battVoltage = (battVoltage < 0.1f) ? v : (BATT_ALPHA*v + (1-BATT_ALPHA)*battVoltage);
+                battCurrent = (battCurrent < 0.01f && c < 0.01f) ? c : (BATT_ALPHA*c + (1-BATT_ALPHA)*battCurrent);
+                battPower   = p; // power is derived, no need to double-filter
+            }
         }
         // LED blink on low battery (via PCF8575)
         static bool lowBattLedTog = false;
-        if (battVoltage>0.1f && battVoltage<BATT_WARN_V) {
+        if (battVoltage>0.1f && battVoltage<battWarnV) {
             lowBattLedTog = !lowBattLedTog;
             lowBattLedTog ? ledOn() : ledOff();
         } else {
@@ -2073,10 +2287,10 @@ void loop() {
         }
 
         // Battery buzzer pattern
-        if (battVoltage>0.1f && battVoltage<BATT_CRIT_V) {
+        if (battVoltage>0.1f && battVoltage<battCritV) {
             // Critical: fast triple beep every 5s
             if (now-lastBuzzMs>5000) { lastBuzzMs=now; beep(3,80,60); vibrate(3,150,100); }
-        } else if (battVoltage>0.1f && battVoltage<BATT_WARN_V) {
+        } else if (battVoltage>0.1f && battVoltage<battWarnV) {
             // Warning: single beep every 15s
             if (now-lastBuzzMs>15000) { lastBuzzMs=now; beep(1,120,0); vibrate(1,250,0); }
         }
@@ -2138,6 +2352,7 @@ void loop() {
         }
     }
 
+    esp_task_wdt_reset(); // feed the watchdog every loop iteration
     yield();
 
     if (now-tDebug >= 5000) {

@@ -101,7 +101,29 @@ Note: module silkscreen uses port-based labels (P0–P7, P10–P17); the bit ind
   - Vibromotor: battery alerts, throttle alerts, connection-lost alert (vibro only, no buzzer, for connection loss).
 - **Backlight auto-dim** — dims after 30s idle, restores on any button press.
 - **Boot animation** — expanding frame + title fade-in.
+- **Throttle-low startup safety** — boot halts on a warning screen (with periodic beep) until the throttle stick is confirmed at minimum, preventing an accidental high-throttle arm right after power-on.
+- **Hardware watchdog** — 3s timeout via `esp_task_wdt`; reboots automatically if the main loop ever locks up (e.g. an I2C/SPI hang) instead of leaving the TX frozen.
+- **EMA-filtered ADC and battery readings** — gimbal/pot inputs and battery voltage use exponential moving average filtering instead of blocking multi-sample averaging, reducing per-cycle blocking time while keeping smooth values.
+- **Packet sequence numbers** — `ChannelPkt` includes a wrapping 8-bit sequence counter, letting the receiver distinguish genuinely dropped packets from normal link latency (separate from the per-second link-quality estimate).
+- **Smoothed ESP-NOW link quality** — uses the same 10-sample rolling window as the nRF24 path instead of a raw per-send 100/0 value.
+- **Reduced NVS writes** — axis-reverse toggles and model-edit saves now write a single model slot instead of all 4, deferred until the screen is exited rather than on every keypress.
+- **Flight timer** — counts up while the ARM channel is active, resets to 0:00 on disarm; shown on the home screen in the gap between the rudder and aileron sliders.
+- **Configurable battery alert thresholds** — "Batt Warn" and "Batt Crit" voltage levels are now adjustable from the Settings menu (0.1V steps) instead of fixed at compile time; the two thresholds are kept from crossing each other.
+- **Simple fixed-wing mixer presets** — selectable per model from the Model Edit screen (Name → Type → **Mixer**): None, Elevon, V-Tail, Flaperon. Mixing happens entirely on the TX by overwriting specific channel slots after expo/rate is applied — the RX has no awareness mixing occurred, it just outputs whatever lands in each channel. See "Mixer Presets" below for exact channel behaviour.
 - **Scrollable menu**, **channel monitor**, **USB HID sim mode**, **About screen**.
+
+## Mixer Presets
+
+Mixing runs after per-axis expo/rate, overwriting specific channel slots in place. Select per-model via Model Edit → Mixer field.
+
+| Mixer | Inputs combined | Output channels |
+|---|---|---|
+| None | — | passthrough, no change |
+| Elevon | Aileron + Elevator stick | CH1 = elevonL, CH2 = elevonR |
+| V-Tail | Elevator + Rudder stick | CH2 = ruddervatorL, CH4 = ruddervatorR |
+| Flaperon | Aileron stick + Pot A (flap slider) | CH1 = aileronL, **CH6 = aileronR** (Camera slot repurposed) |
+
+⚠️ **Flaperon repurposes CH6** (normally the Camera/Aux channel) as the second aileron servo output. Don't use the Flaperon mixer on a model where CH6 is wired to something else.
 
 ## Libraries Required
 

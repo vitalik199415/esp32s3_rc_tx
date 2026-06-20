@@ -41,6 +41,7 @@
 #include <esp_mac.h>
 #include <Preferences.h>
 #include <ESP32Servo.h>
+#include <esp_task_wdt.h>
 
 // =============================================================================
 // CONFIGURATION
@@ -104,6 +105,8 @@ struct EspNowPkt {
 // Shared channel-data struct — MUST be byte-identical to TX definition.
 // Copy-paste this block from TX if either side is ever modified.
 struct __attribute__((packed)) ChannelPkt {
+    uint8_t  seq;           // increments every packet — used to detect
+                             // dropped packets via gaps in sequence
     uint16_t channels[10]; // CH1-CH10, raw microsecond values 1000-2000
 };
 
@@ -124,6 +127,12 @@ uint32_t lastPktMs    = 0;
 // Telemetry tracking
 int8_t   lastRssi      = 0;    // RSSI of last received packet
 uint8_t  pktCount      = 0;    // packets received in last second
+uint8_t  lastSeq       = 0;    // last received sequence number
+bool     seqInit       = false;
+uint16_t droppedPkts   = 0;    // count of detected gaps (for debug/telemetry)
+uint32_t lastAnyRecvMs = 0;    // updated on ANY ESP-NOW packet, not just DATA
+                                // — used to detect total radio silence (stack
+                                // glitch) vs. normal signal loss (no TX in range)
 uint8_t  linkQuality   = 0;    // 0-100%
 uint32_t lqWindowMs    = 0;    // window start time for LQ calc
 
@@ -137,6 +146,9 @@ uint32_t pairBtnMs    = 0;
 bool     pairBtnHeld  = false;
 
 Servo       servos[SERVO_COUNT];
+uint16_t    lastServoUs[SERVO_COUNT]; // last value actually written — skip redundant writes
+#define SERVO_SMOOTHING 1              // 1=EMA-smooth servo output, 0=raw passthrough
+float       servoEma[SERVO_COUNT];     // EMA state, used only if SERVO_SMOOTHING
 Preferences prefs;
 
 // =============================================================================
@@ -194,9 +206,28 @@ void clearTxMac() {
 // =============================================================================
 // SERVOS
 // =============================================================================
+// Only calls writeMicroseconds() when the value actually changed by more
+// than a small threshold — avoids needless LEDC register writes every cycle.
+const uint16_t SERVO_WRITE_THRESHOLD = 2; // microseconds
+
 void servosWrite(const uint16_t* us) {
-    for (int i = 0; i < SERVO_COUNT; i++)
-        servos[i].writeMicroseconds(constrain(us[i], CH_MIN, CH_MAX));
+    for (int i = 0; i < SERVO_COUNT; i++) {
+        uint16_t target = constrain(us[i], CH_MIN, CH_MAX);
+
+#if SERVO_SMOOTHING
+        const float ALPHA = 0.4f; // higher = less smoothing, more responsive
+        if (servoEma[i] == 0) servoEma[i] = target; // first-run init
+        servoEma[i] = ALPHA * target + (1.0f - ALPHA) * servoEma[i];
+        uint16_t outVal = (uint16_t)servoEma[i];
+#else
+        uint16_t outVal = target;
+#endif
+
+        if (abs((int)outVal - (int)lastServoUs[i]) >= SERVO_WRITE_THRESHOLD) {
+            servos[i].writeMicroseconds(outVal);
+            lastServoUs[i] = outVal;
+        }
+    }
 }
 
 void servosFailsafe() { servosWrite(FAILSAFE_US); }
@@ -265,6 +296,7 @@ void sendPairAck(const uint8_t* toMac) {
 // =============================================================================
 void onRecv(const esp_now_recv_info_t* info, const uint8_t* rawData, int len) {
     if (len < 1) return;
+    lastAnyRecvMs = millis(); // any packet at all proves the radio stack is alive
     PktType type = (PktType)rawData[0];
 
     if (type == PTYPE_PAIR_REQ && rxState == RX_PAIRING && len >= 7) {
@@ -290,9 +322,25 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* rawData, int len) {
         }
         // Struct cast — no manual byte unpacking, guaranteed to match TX layout
         const EspNowDataPkt* pkt = (const EspNowDataPkt*)rawData;
+
+        // Sequence gap detection — counts actual dropped packets, distinct
+        // from the per-second packet-count-based link quality estimate.
+        if (seqInit) {
+            uint8_t expected = lastSeq + 1; // wraps naturally at 255->0
+            if (pkt->ch.seq != expected) {
+                uint8_t gap = pkt->ch.seq - expected; // wrap-safe due to uint8_t
+                droppedPkts += gap;
+            }
+        }
+        lastSeq  = pkt->ch.seq;
+        seqInit  = true;
+
         for (int i = 0; i < 10; i++) chData[i] = pkt->ch.channels[i];
         lastPktMs = millis();
-        rxState   = RX_NORMAL;
+        // Note: rxState is NOT set here. The main loop's failsafe block is
+        // the single source of truth for FAILSAFE<->NORMAL transitions,
+        // based on lastPktMs freshness — avoids two code paths racing to
+        // set the same state.
     }
 }
 
@@ -306,6 +354,15 @@ void setup() {
     delay(500);
     Serial.println("\n=== RC Receiver ESP-NOW v1.0 (C3 SuperMini) ===");
 
+    // Watchdog — reboots automatically if the main loop ever locks up
+    esp_task_wdt_config_t wdtConfig = {
+        .timeout_ms     = 3000,
+        .idle_core_mask = 0,
+        .trigger_panic  = true
+    };
+    esp_task_wdt_init(&wdtConfig);
+    esp_task_wdt_add(NULL);
+
     // LED — active LOW, start OFF
     pinMode(LED_PIN,      OUTPUT);
     pinMode(PAIR_BTN_PIN, INPUT_PULLUP);
@@ -314,12 +371,20 @@ void setup() {
     // Brief boot flash
     ledFlash(2, 100, 80);
 
-    // Servos
+    // Servos — attach each, track failures, report a clear summary
+    uint8_t servoFailCount = 0;
     for (int i = 0; i < SERVO_COUNT; i++) {
-        Serial.printf("Attach servo %d on GPIO%d\n", i, SERVO_PINS[i]);
         bool ok = servos[i].attach(SERVO_PINS[i], CH_MIN, CH_MAX);
-        Serial.printf("Result = %d\n", ok);
+        Serial.printf("[RX] Servo %d (GPIO%d): %s\n", i, SERVO_PINS[i], ok ? "OK" : "FAILED");
+        if (!ok) servoFailCount++;
         servos[i].writeMicroseconds(CH_MID);
+        lastServoUs[i] = CH_MID;
+    }
+    if (servoFailCount > 0) {
+        Serial.printf("[RX] WARNING: %d of %d servos failed to attach\n", servoFailCount, SERVO_COUNT);
+        ledFlash(servoFailCount, 60, 60); // distinct pattern: N fast flashes = N failed servos
+    } else {
+        Serial.println("[RX] All servos attached OK");
     }
 
     // Load paired TX MAC
@@ -331,12 +396,25 @@ void setup() {
         Serial.println("[RX] No saved TX — will enter pairing mode");
     }
 
-    // ESP-NOW init
+    // ESP-NOW init — retry with backoff instead of halting forever.
+    // A transient WiFi-stack hiccup at boot shouldn't permanently brick
+    // the receiver until power-cycled.
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("[RX] ESP-NOW init FAILED!");
-        while (1) { ledFlash(10, 50, 50); delay(500); }
+    bool espNowReady = false;
+    for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+        if (esp_now_init() == ESP_OK) { espNowReady = true; break; }
+        Serial.printf("[RX] ESP-NOW init failed (attempt %d/5) — retrying...\n", attempt);
+        ledFlash(1, 80, 0);
+        delay(300 * attempt); // backoff: 300, 600, 900, 1200ms
+    }
+    if (!espNowReady) {
+        // Still failed after retries — likely a hardware/core issue, not transient.
+        // Reboot rather than spinning forever; the watchdog would catch this
+        // anyway, but an explicit restart is faster and clearer in the log.
+        Serial.println("[RX] ESP-NOW init FAILED after 5 attempts — rebooting");
+        delay(100);
+        ESP.restart();
     }
     esp_now_register_send_cb(onSend);
     esp_now_register_recv_cb(onRecv);
@@ -401,19 +479,27 @@ void loop() {
         pairBtnHeld = false;
     }
 
-    // ── Failsafe ──────────────────────────────────────────────────────────────
-    if (rxState == RX_NORMAL && paired) {
-        if ((now - lastPktMs) > FAILSAFE_MS) {
+    // ── Failsafe + servo update (rate-limited to 50Hz, not every loop tick) ───
+    static uint32_t tServo = 0;
+    bool signalFresh = paired && (now - lastPktMs) <= FAILSAFE_MS;
+
+    // Single source of truth for state transitions
+    if (paired) {
+        if (signalFresh && rxState == RX_FAILSAFE) {
+            rxState = RX_NORMAL;
+            Serial.println("[RX] Signal restored");
+        } else if (!signalFresh && rxState == RX_NORMAL) {
             rxState = RX_FAILSAFE;
             Serial.println("[RX] FAILSAFE");
-            servosFailsafe();
-        } else {
-            servosFromChannels();
         }
     }
-    if (rxState == RX_FAILSAFE && (now - lastPktMs) < FAILSAFE_MS) {
-        rxState = RX_NORMAL;
-        Serial.println("[RX] Signal restored");
+
+    if (now - tServo >= 20) { // 50Hz — matches typical TX send rate
+        tServo = now;
+        if (paired) {
+            if (signalFresh) servosFromChannels();
+            else             servosFailsafe();
+        }
     }
 
     // ── LED blink pattern ─────────────────────────────────────────────────────
@@ -449,10 +535,44 @@ void loop() {
     if (now - lastPrintMs > 2000) {
         lastPrintMs = now;
         const char* st[] = {"NORMAL","PAIRING","FAILSAFE"};
-        Serial.printf("[RX] %s  LQ:%d%%  RSSI:%ddBm  CH3:%d  ARM:%s\n",
+        Serial.printf("[RX] %s  LQ:%d%%  RSSI:%ddBm  CH3:%d  ARM:%s  Drop:%u\n",
             st[rxState], linkQuality, (int)lastRssi,
-            chData[2], chData[6] > 1700 ? "ON" : "OFF");
+            chData[2], chData[6] > 1700 ? "ON" : "OFF", droppedPkts);
     }
 
+    // ── Total-silence recovery (ESP-NOW stack glitch detection) ──────────────
+    // If we've received absolutely nothing — not even broadcast pairing
+    // traffic — for 30s while expecting activity, the WiFi/ESP-NOW stack
+    // may have wedged. Re-init rather than waiting for a manual power cycle.
+    static uint32_t silenceCheckMs = 0;
+    if (lastAnyRecvMs == 0) lastAnyRecvMs = now; // avoid false trigger right at boot
+    if ((now - lastAnyRecvMs) > 30000 && (now - silenceCheckMs) > 30000) {
+        silenceCheckMs = now;
+        Serial.println("[RX] WARNING: no ESP-NOW traffic for 30s — reinitializing stack");
+        esp_now_deinit();
+        delay(100);
+        if (esp_now_init() == ESP_OK) {
+            esp_now_register_send_cb(onSend);
+            esp_now_register_recv_cb(onRecv);
+            uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+            esp_now_peer_info_t bPeer = {};
+            memcpy(bPeer.peer_addr, broadcast, 6);
+            bPeer.channel = ESPNOW_CHANNEL; bPeer.encrypt = false;
+            esp_now_add_peer(&bPeer);
+            if (paired) {
+                esp_now_peer_info_t txPeer = {};
+                memcpy(txPeer.peer_addr, txMac, 6);
+                txPeer.channel = ESPNOW_CHANNEL; txPeer.encrypt = false;
+                esp_now_add_peer(&txPeer);
+            }
+            lastAnyRecvMs = now;
+            Serial.println("[RX] ESP-NOW stack reinitialized");
+        } else {
+            Serial.println("[RX] ESP-NOW reinit failed — rebooting");
+            ESP.restart();
+        }
+    }
+
+    esp_task_wdt_reset(); // feed the watchdog every loop iteration
     yield();
 }
