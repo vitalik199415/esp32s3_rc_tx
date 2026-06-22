@@ -231,6 +231,7 @@ ModelProfile models[MODEL_COUNT];
 uint8_t      activeModel = 0;
 
 const char* modelTypeNames[] = { "Airplane", "Car", "Heli", "Drone" };
+const char* mixerTypeNames[] = { "None", "Elevon", "V-Tail", "Flaperon" };
 
 void modelsDefault() {
     const char* names[MODEL_COUNT] = { "Model 1","Model 2","Model 3","Model 4" };
