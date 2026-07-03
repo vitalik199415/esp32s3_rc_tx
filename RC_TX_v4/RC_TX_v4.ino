@@ -22,7 +22,6 @@
 #include <esp_mac.h>
 #include <USB.h>
 #include <USBHIDGamepad.h>
-#include <esp_task_wdt.h>
 #include "config.h"
 #include "icons.h"
 
@@ -172,11 +171,11 @@ void beep(uint8_t count, uint16_t onMs, uint16_t offMs);
 // =============================================================================
 // PERIPHERALS
 // =============================================================================
-U8G2_ST7565_NHD_C12864_F_4W_HW_SPI* display = nullptr;
-Adafruit_INA219*                     ina219  = nullptr;
-RF24*                                radio   = nullptr;
-USBHIDGamepad*                       gamepad = nullptr;
-Preferences                          prefs;
+U8G2_ST7565_ERC12864_ALT_F_4W_SW_SPI* display = nullptr;
+Adafruit_INA219*                      ina219  = nullptr;
+RF24*                                 radio   = nullptr;
+USBHIDGamepad*                        gamepad = nullptr;
+Preferences                           prefs;
 
 // =============================================================================
 // CHANNELS
@@ -885,7 +884,7 @@ void simSend() {
 // SETTINGS PERSISTENCE
 // =============================================================================
 Setting settings[] = {
-    { "Contrast",   58,  0, 255, 5,  1 },  // ST7565R: 58 default, tune as needed
+    { "Contrast",   60,  0, 255, 5,  1 },  // ST7565R: 58 default, tune as needed
     { "Backlight", 200,  0, 255, 5,  1 },
     { "Batt Warn",  70, 50,  84, 1, 10 },  // deci-volts: 70 = 7.0V
     { "Batt Crit",  66, 48,  80, 1, 10 },  // deci-volts: 66 = 6.6V
@@ -2112,15 +2111,6 @@ void setup() {
     Serial.begin(115200);
     delay(500); // brief pause for Serial Monitor to attach
 
-    // Watchdog — catches firmware lockups (e.g. I2C/SPI hang) and reboots
-    // instead of leaving the TX frozen mid-flight.
-    esp_task_wdt_config_t wdtConfig = {
-        .timeout_ms     = 3000,
-        .idle_core_mask = 0,
-        .trigger_panic  = true
-    };
-    esp_task_wdt_init(&wdtConfig);
-    esp_task_wdt_add(NULL);
     Serial.println("\n=== RC Transmitter v3.1 ===");
 
 
@@ -2157,10 +2147,8 @@ void setup() {
     Serial.println("[INIT] PCF8575 OK");
     ledOn(); // LED on during rest of init
 
-    display = new U8G2_ST7565_NHD_C12864_F_4W_HW_SPI(
-        U8G2_R2, PIN_LCD_CS, PIN_LCD_DC, U8X8_PIN_NONE);
+    display = new U8G2_ST7565_ERC12864_ALT_F_4W_SW_SPI(U8G2_R0, PIN_SPI_SCK, PIN_SPI_MOSI, PIN_LCD_CS, PIN_LCD_DC, U8X8_PIN_NONE);
     display->begin();
-    display->setPowerSave(0);
     display->setContrast(settings[0].value);
     Serial.println("[INIT] Display OK");
 
@@ -2173,7 +2161,7 @@ void setup() {
     if (inaOk) ina219->setCalibration_32V_1A();
     Serial.printf("[INIT] INA219: %s\n", inaOk?"OK":"not found");
 
-    nrfOk    = nrfInit();
+   // nrfOk    = nrfInit();
     espnowOk = espnowInit();
 
     gamepad = new USBHIDGamepad();
@@ -2199,7 +2187,6 @@ void setup() {
         Serial.println("[SAFETY] Throttle high at boot — waiting for minimum");
         while (true) {
             readAnalog();
-            esp_task_wdt_reset();
             if (channels[2] <= (CH_THROTTLE_MIN + 100)) break;
             beep(1, 100, 0);
             delay(400); // intentional — safety gate, not a hot path
@@ -2353,7 +2340,6 @@ void loop() {
         }
     }
 
-    esp_task_wdt_reset(); // feed the watchdog every loop iteration
     yield();
 
     if (now-tDebug >= 5000) {
