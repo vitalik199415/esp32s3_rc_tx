@@ -1039,7 +1039,7 @@ void drawModelBitmap(uint8_t x, uint8_t y, const unsigned char* pgmBmp) {
     // Invert into stack buffer then draw normally
     uint8_t buf[72];
     for (uint8_t i = 0; i < 72; i++) buf[i] = ~pgm_read_byte(&pgmBmp[i]);
-    display->drawXBM(x, y, 24, 24, buf);
+    display->drawXBMP(x, y, 24, 24, pgmBmp);
 }
 
 void drawStatusBar() {
@@ -1072,8 +1072,6 @@ void drawStatusBar() {
     } else {
         display->drawStr(110, 9, "--V");
     }
-
-    display->drawHLine(0, 12, 128);
 }
 
 void drawBreadcrumb(const char* t) {
@@ -1142,7 +1140,7 @@ void drawHome() {
     // ==========================================================================
 
     const uint8_t VY=13, VH=42;
-    const uint8_t HY=56, HH=7;
+    const uint8_t HY=58, HH=5;
     const uint8_t HW=50; // horizontal bar width
 
     // ── THROTTLE — 3px wide, fill from bottom ────────────────────────────────
@@ -1229,21 +1227,21 @@ void drawHome() {
     }
     // Pot bars — one row each, label + bar
     display->setFont(u8g2_font_4x6_tr);
-    display->drawStr(4, 50, "9");
+    display->drawStr(10, 55, "9");
     {
         float pct = constrain((float)(channels[8]-CH_MIN)/(CH_MAX-CH_MIN), 0.f, 1.f);
-        display->drawFrame(10, 45, 38, 5);
-        for (uint8_t xx=11;xx<47;xx+=2) display->drawPixel(xx, 47);
+        display->drawFrame(16, 50, 38, 5);
+        for (uint8_t xx=17;xx<53;xx+=2) display->drawPixel(xx, 52);
         uint8_t pos=(uint8_t)(pct*34)+1;
-        display->drawBox(10+pos, 46, 2, 3);
+        display->drawBox(16+pos, 51, 2, 3);
     }
-    display->drawStr(4, 57, "10");
+    display->drawStr(69, 55, "10");
     {
         float pct = constrain((float)(channels[9]-CH_MIN)/(CH_MAX-CH_MIN), 0.f, 1.f);
-        display->drawFrame(10, 52, 38, 5);
-        for (uint8_t xx=11;xx<47;xx+=2) display->drawPixel(xx, 54);
+        display->drawFrame(78, 50, 38, 5);
+        for (uint8_t xx=79;xx<117;xx+=2) display->drawPixel(xx, 52);
         uint8_t pos=(uint8_t)(pct*34)+1;
-        display->drawBox(10+pos, 53, 2, 3);
+        display->drawBox(78+pos, 51, 2, 3);
     }
 
     // ── MODEL ICON (x=52..75, y=13..36) ─────────────────────────────────────
@@ -1255,23 +1253,23 @@ void drawHome() {
         char sw[8];
         // CH5: 3-pos → 1/2/3
         snprintf(sw, sizeof(sw), "5:%d", sw3pos(channels[4]));
-        display->drawStr(77, 19, sw);
+        display->drawStr(100, 19, sw);
         // CH6: 3-pos → 1/2/3
         snprintf(sw, sizeof(sw), "6:%d", sw3pos(channels[5]));
-        display->drawStr(77, 27, sw);
+        display->drawStr(100, 27, sw);
         // CH7: 2-pos → ON/off
         bool a = channels[6]>1700;
-        display->drawStr(77, 35, a ? "7:ON" : "7:off");
+        display->drawStr(100, 35, a ? "7:ON" : "7:off");
         // CH8: 2-pos → ON/off
         bool r = channels[7]>1700;
-        display->drawStr(77, 43, r ? "8:ON" : "8:off");
+        display->drawStr(100, 43, r ? "8:ON" : "8:off");
     }
 
     // ── WARNINGS (overlay, highest priority) ─────────────────────────────────
     if (battVoltage > 0.1f && battVoltage < battCritV) {
-        display->drawBox(4, 56, 70, 7);
+        display->drawBox(29, 42, 70, 7);
         display->setDrawColor(0);
-        display->drawStr(5, 62, "LOW BATTERY!");
+        display->drawStr(35, 48, "LOW BATTERY!");
         display->setDrawColor(1);
     }
     {
@@ -1280,9 +1278,9 @@ void drawHome() {
             ? (channels[6] > 1700 && abs((int)channels[2] - (int)CH_MID) > 150)
             : (channels[6] > 1700 && (int)channels[2] > (int)(CH_THROTTLE_MIN + 150));
         if (thrBad) {
-            display->drawBox(4, 56, 70, 7);
+            display->drawBox(29, 42, 70, 7);
             display->setDrawColor(0);
-            display->drawStr(5, 62, isCar ? "THR NOT CTR!" : "THR HIGH!");
+            display->drawStr(35, 48, isCar ? "THR NOT CTR!" : "THR HIGH!");
             display->setDrawColor(1);
         }
     }
@@ -1744,86 +1742,116 @@ void drawModelEdit() {
 
     // ── Name field ────────────────────────────────────────────────────────────
     bool nameSel = (editField == 0);
+
     if (nameSel && !editFieldMode) {
         display->drawBox(0, 13, 128, 11);
-        display->setDrawColor(0);
+        display->setDrawColor(0);      // Black text on white background
+    } else {
+        display->setDrawColor(1);      // White text on black background
     }
+
     display->drawStr(2, 22, "Name:");
-    display->setDrawColor(1);
 
     if (nameSel && editFieldMode) {
-        // Show name with cursor highlighted
-        char nameBuf[17]; strncpy(nameBuf, m.name, 16); nameBuf[16]=0;
+        display->setDrawColor(1);
+
+        char nameBuf[17];
+        strncpy(nameBuf, m.name, 16);
+        nameBuf[16] = 0;
+
         uint8_t nx = 38;
+
         for (uint8_t i = 0; i < 10 && nameBuf[i]; i++) {
-            char ch[2] = {nameBuf[i], 0};
+            char ch[2] = { nameBuf[i], 0 };
+
             if (i == nameCursor) {
-                display->drawBox(nx-1, 14, 7, 9);
-                display->setDrawColor(1);
+                // Highlight current character
+                display->drawBox(nx - 1, 14, 7, 9);
+
+                display->setDrawColor(0);      // Black character on white box
                 display->drawStr(nx, 22, ch);
-                display->setDrawColor(0);
+                display->setDrawColor(1);
             } else {
                 display->drawStr(nx, 22, ch);
             }
+
             nx += 7;
         }
-        // Show cursor at end if past current length
+
+        // Cursor after last character
         uint8_t len = strlen(nameBuf);
-        if (nameCursor >= len && len < 15) {
-            display->drawBox(38 + nameCursor*7 - 1, 14, 7, 9);
+        if (nameCursor >= len && nameCursor < 16) {
+            uint8_t cx = 38 + nameCursor * 7;
+
+            display->drawBox(cx - 1, 14, 7, 9);
+
+            display->setDrawColor(0);
+            display->drawStr(cx, 22, "_");    // or " "
+            display->setDrawColor(1);
         }
     } else {
-        // Just show name
-        char nameBuf[17]; strncpy(nameBuf, m.name, 16); nameBuf[16]=0;
-        if (!nameSel) { display->setDrawColor(0); }
-        display->drawStr(38, 22, nameBuf);
-        display->setDrawColor(0);
+        display->drawStr(38, 22, m.name);
     }
+
+    display->setDrawColor(1);
 
     // ── Type field ────────────────────────────────────────────────────────────
     bool typeSel = (editField == 1);
+
     if (typeSel && !editFieldMode) {
         display->drawBox(0, 26, 128, 11);
         display->setDrawColor(0);
+    } else {
+        display->setDrawColor(1);
     }
+
     display->drawStr(2, 35, "Type:");
+
     if (typeSel && editFieldMode) {
-        // Show with arrows
-        display->drawStr(36, 35, " ");
+        display->drawStr(36, 35, "\x7F ");
         display->drawStr(44, 35, modelTypeNames[m.type]);
         uint8_t tw = display->getStrWidth(modelTypeNames[m.type]);
-        display->drawStr(46+tw, 35, " x");
+        display->drawStr(46 + tw, 35, " x");
     } else {
         display->drawStr(38, 35, modelTypeNames[m.type]);
     }
+
     display->setDrawColor(1);
 
     // ── Mixer field ───────────────────────────────────────────────────────────
     bool mixerSel = (editField == 2);
+
     if (mixerSel && !editFieldMode) {
         display->drawBox(0, 39, 128, 11);
         display->setDrawColor(0);
+    } else {
+        display->setDrawColor(1);
     }
+
     display->drawStr(2, 48, "Mixer:");
+
     if (mixerSel && editFieldMode) {
-        display->drawStr(40, 48, " ");
+        display->drawStr(40, 48, "\x7F ");
         display->drawStr(48, 48, mixerTypeNames[m.mixerType]);
         uint8_t mw = display->getStrWidth(mixerTypeNames[m.mixerType]);
-        display->drawStr(50+mw, 48, " x");
+        display->drawStr(50 + mw, 48, " x");
     } else {
         display->drawStr(42, 48, mixerTypeNames[m.mixerType]);
     }
+
     display->setDrawColor(1);
 
-    // ── Hint ─────────────────────────────────────────────────────────────────
+    // ── Hint ──────────────────────────────────────────────────────────────────
     display->setFont(u8g2_font_4x6_tr);
+
     if (editFieldMode && editField == 0) {
-        display->drawStr(2, 63, " char  Rt next  OK done");
+        display->drawStr(2, 63, "^v char  -> next  OK done");
     } else if (editFieldMode && (editField == 1 || editField == 2)) {
-        display->drawStr(2, 63, " change   OK/Back done");
+        display->drawStr(2, 63, "^v change   OK/<- done");
     } else {
-        display->drawStr(2, 63, " select  OK edit  Back save");
+        display->drawStr(2, 63, "^v select  OK edit  <- save");
     }
+
     display->sendBuffer();
 }
 
@@ -2278,13 +2306,13 @@ void setup() {
 
     display = new U8G2_ST7565_ERC12864_ALT_F_4W_SW_SPI(U8G2_R0, PIN_SPI_SCK, PIN_SPI_MOSI, PIN_LCD_CS, PIN_LCD_DC, U8X8_PIN_NONE);
     display->begin();
-    //display->setPowerSave(0);
     display->setContrast(60);
     Serial.println("[INIT] Display OK");
 
     // Boot animation — expanding frame + title fade-in
     display->drawXBMP(0, 0, 128, 64, icon_logo);
-    delay(1000);
+    display->sendBuffer();
+    delay(3000);
 
     ina219 = new Adafruit_INA219(INA219_ADDR);
     inaOk  = ina219->begin();
@@ -2296,7 +2324,7 @@ void setup() {
 
     gamepad = new USBHIDGamepad();
     gamepad->begin();
-    USB.productName("RC Transmitter v3");
+    USB.productName("RC Transmitter v4");
     USB.manufacturerName("RC-TX");
     USB.begin();
 
