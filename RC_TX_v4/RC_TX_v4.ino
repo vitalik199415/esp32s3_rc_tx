@@ -22,6 +22,7 @@
 #include <esp_mac.h>
 #include <USB.h>
 #include <USBHIDGamepad.h>
+#include "freertos/semphr.h"
 #include "config.h"
 #include "icons.h"
 
@@ -80,7 +81,7 @@ enum CalibState : uint8_t { CALIB_IDLE, CALIB_CENTER, CALIB_EXTREME, CALIB_DONE 
 
 enum UiState : uint8_t {
     UI_HOME = 0, UI_MENU,
-    UI_MODELS, UI_MODEL_EDIT, UI_CHANNELS, UI_AXIS_REVERSE, UI_RATES, UI_RADIO, UI_ESPNOW_PAIR,
+    UI_MODELS, UI_MODEL_EDIT, UI_CHANNELS, UI_CH_MAP, UI_AXIS_REVERSE, UI_RATES, UI_RADIO, UI_ESPNOW_PAIR,
     UI_CALIBRATE, UI_SETTINGS, UI_TELEMETRY, UI_ABOUT
 };
 
@@ -102,6 +103,9 @@ struct ModelProfile {
     // TX send frequency in Hz: 25, 50, 100
     uint8_t   txFreqHz;
     MixerType mixerType; // fixed-wing mixer preset — see MixerType enum above
+    // Channel remap: chRemap[i] = TX source index that feeds RX output slot i
+    // Default identity (0→0 .. 9→9) — change to reroute any TX channel to any RX slot
+    uint8_t   chRemap[10];
 };
 
 struct BtnState {
@@ -180,7 +184,7 @@ Preferences                           prefs;
 // =============================================================================
 // CHANNELS
 // =============================================================================
-uint16_t channels[CHANNEL_COUNT];
+volatile uint16_t channels[CHANNEL_COUNT]; // written by Core 0 radioTask, read by Core 1 loop()
 
 void channelsInit() {
     for (int i = 0; i < CHANNEL_COUNT; i++) channels[i] = CH_MID;
@@ -246,6 +250,7 @@ void modelsDefault() {
         for (int i = 0; i < 4; i++) { models[m].expo[i] = 0; models[m].rate[i] = 100; }
         models[m].txFreqHz  = 50;
         models[m].mixerType = MIXER_NONE;
+        for (int i = 0; i < 10; i++) models[m].chRemap[i] = i; // identity — no remap
     }
 }
 
@@ -302,6 +307,12 @@ bool      nrfOk       = false;
 bool      espnowOk    = false;
 bool      simModeOn   = false;
 bool      espnowSendOk = false;
+
+// Mutex protecting channels[] between Core 0 radioTask (writer) and Core 1 loop() (reader).
+// NOTE: INA219 and PCF8575 both share Wire — INA219 reads in loop() at ~1Hz and PCF8575
+// reads in radioTask at 100Hz. Collision probability is very low and smoothing absorbs
+// any single corrupted sample. Add a Wire mutex here if this proves problematic.
+static SemaphoreHandle_t sharedMux = nullptr;
 
 // Telemetry received from RX (populated by onEspNowRecv)
 struct TelemState {
@@ -648,7 +659,8 @@ void nrfSend() {
     static uint8_t txSeq = 0;
     ChannelPkt pkt;
     pkt.seq = txSeq++;
-    for (int i = 0; i < 10; i++) pkt.channels[i] = channels[i];
+    // chRemap[i] = source TX channel for RX output slot i (identity by default)
+    for (int i = 0; i < 10; i++) pkt.channels[i] = channels[models[activeModel].chRemap[i]];
     bool ok = radio->write(&pkt, sizeof(ChannelPkt));
     static uint8_t lq[10]={0}; static uint8_t li=0;
     lq[li++%10] = ok?10:0;
@@ -734,7 +746,7 @@ void espnowSend() {
     EspNowDataPkt pkt;
     pkt.type     = PTYPE_DATA;
     pkt.ch.seq   = espTxSeq++;
-    for (int i=0;i<10;i++) pkt.ch.channels[i] = channels[i];
+    for (int i=0;i<10;i++) pkt.ch.channels[i] = channels[models[activeModel].chRemap[i]];
     esp_now_send(espnowPeer, (uint8_t*)&pkt, sizeof(EspNowDataPkt));
 
     // Smoothed link quality — same rolling-window approach as nRF24,
@@ -802,13 +814,16 @@ static bool     wasLinked         = false; // tracks link state for edge detecti
 
 // Throttle warning — shown on home screen
 bool throttleWarning() {
-    // Warn if ARM is on but throttle is not at minimum at boot or after disarm
+    // For airplane/drone/heli: warn if throttle is not at minimum (bottom) when arming.
+    // For car: throttle center (1500µs) = stopped, so warn if not near center instead.
     static bool wasArmed = false;
     bool armed = channels[6] > 1700;
     if (armed && !wasArmed) {
-        // Just armed — check throttle
         wasArmed = true;
-        return channels[2] > (CH_THROTTLE_MIN + 100);
+        bool isCar = (models[activeModel].type == MODEL_CAR);
+        return isCar
+            ? (abs((int)channels[2] - (int)CH_MID) > 100)  // car: must be near center
+            : ((int)channels[2] > (int)(CH_THROTTLE_MIN + 100));  // others: must be at bottom
     }
     if (!armed) wasArmed = false;
     return false;
@@ -848,17 +863,17 @@ void simSend() {
     }
 
     // --- 2. TRANSMIT VIA NATIVE ESP32 USBHIDGamepad::send() ---
-    // Mapping matches standard RC conventions:
-    // CH1 (Aileron), CH2 (Elevator), CH3 (Throttle), CH4 (Rudder), CH9 (Pot A), CH10 (Pot B)
+    // chRemap applied: gamepad axis i reads from TX source channels[chRemap[i]]
+    const uint8_t* r = models[activeModel].chRemap;
     bool ok = gamepad->send(
-        ax(channels[0]), // X  -> CH1 (Aileron / Right Stick X)
-        ax(channels[1]), // Y  -> CH2 (Elevator / Right Stick Y)
-        ax(channels[3]), // Z  -> CH4 (Rudder / Left Stick X)
-        ax(channels[2]), // Rz -> CH3 (Throttle / Left Stick Y)
-        ax(channels[8]), // Rx -> CH9 (Left Shoulder Pot A)
-        ax(channels[9]), // Ry -> CH10 (Right Shoulder Pot B)
-        0,               // Hat Switch (0 = Centered/None)
-        b                // 32-bit Button bitmask (Buttons 1 to 6 mapped)
+        ax(channels[r[0]]), // X  -> remapped CH1 (Aileron / Right Stick X)
+        ax(channels[r[1]]), // Y  -> remapped CH2 (Elevator / Right Stick Y)
+        ax(channels[r[3]]), // Z  -> remapped CH4 (Rudder / Left Stick X)
+        ax(channels[r[2]]), // Rz -> remapped CH3 (Throttle / Left Stick Y)
+        ax(channels[r[8]]), // Rx -> remapped CH9 (Left Shoulder Pot A)
+        ax(channels[r[9]]), // Ry -> remapped CH10 (Right Shoulder Pot B)
+        0,                  // Hat Switch (0 = Centered/None)
+        b                   // 32-bit Button bitmask (Buttons 1 to 6 mapped)
     );
 
     usbReady = ok;
@@ -1009,10 +1024,10 @@ uint8_t charToIdx(char ch) {
 }
 
 const char* menuItems[] = {
-    "Dashboard", "Models", "Channels", "Axis Reverse", "Expo & Rates",
+    "Dashboard", "Models", "Channels", "Ch Map", "Axis Reverse", "Expo & Rates",
     "Radio", "Telemetry", "Calibrate", "Settings", "About"
 };
-const uint8_t MENU_COUNT     = 10;
+const uint8_t MENU_COUNT     = 11;
 const uint8_t MENU_VISIBLE   = 4; // items visible at once (with 6x10 font)
 
 // =============================================================================
@@ -1259,11 +1274,17 @@ void drawHome() {
         display->drawStr(5, 62, "LOW BATTERY!");
         display->setDrawColor(1);
     }
-    if (channels[6] > 1700 && channels[2] > (CH_THROTTLE_MIN + 150)) {
-        display->drawBox(4, 56, 70, 7);
-        display->setDrawColor(0);
-        display->drawStr(5, 62, "THR HIGH!");
-        display->setDrawColor(1);
+    {
+        bool isCar = (models[activeModel].type == MODEL_CAR);
+        bool thrBad = isCar
+            ? (channels[6] > 1700 && abs((int)channels[2] - (int)CH_MID) > 150)
+            : (channels[6] > 1700 && (int)channels[2] > (int)(CH_THROTTLE_MIN + 150));
+        if (thrBad) {
+            display->drawBox(4, 56, 70, 7);
+            display->setDrawColor(0);
+            display->drawStr(5, 62, isCar ? "THR NOT CTR!" : "THR HIGH!");
+            display->setDrawColor(1);
+        }
     }
 
     display->sendBuffer();
@@ -1806,6 +1827,45 @@ void drawModelEdit() {
     display->sendBuffer();
 }
 
+void drawChMap() {
+    display->clearBuffer();
+    drawBreadcrumb("Ch Map");
+    display->setFont(u8g2_font_4x6_tr);
+
+    ModelProfile& m = models[activeModel];
+
+    // Two-column layout: CH1-CH5 left, CH6-CH10 right
+    display->drawStr(2,  17, "OUT SRC");
+    display->drawStr(66, 17, "OUT SRC");
+    display->drawHLine(0, 19, 128);
+
+    for (uint8_t i = 0; i < 10; i++) {
+        uint8_t col = (i >= 5) ? 1 : 0;
+        uint8_t row = i % 5;
+        uint8_t x   = col * 64;
+        uint8_t y   = 26 + row * 7;
+        bool    sel = (i == (uint8_t)settingCursor);
+
+        if (sel) {
+            if (settingEditMode) {
+                display->drawFrame(x, y-5, 62, 7); // dashed border = edit mode
+            } else {
+                display->drawBox(x, y-5, 62, 7);
+                display->setDrawColor(0);
+            }
+        }
+        char buf[10];
+        snprintf(buf, sizeof(buf), "C%-2d C%-2d", i+1, m.chRemap[i]+1);
+        display->drawStr(x+2, y, buf);
+        display->setDrawColor(1);
+    }
+
+    display->drawStr(2, 63, settingEditMode
+        ? "\x1e\x1f src  OK/Bk confirm"
+        : "\x1e\x1f sel  OK edit  Bk save");
+    display->sendBuffer();
+}
+
 void renderFrame() {
     switch (uiState) {
         case UI_HOME:      drawHome();      break;
@@ -1813,6 +1873,7 @@ void renderFrame() {
         case UI_MODELS:    drawModels();    break;
         case UI_MODEL_EDIT: drawModelEdit(); break;
         case UI_CHANNELS:     drawChannels();    break;
+        case UI_CH_MAP:       drawChMap();       break;
         case UI_AXIS_REVERSE: drawAxisReverse(); break;
         case UI_RATES:        drawRates();       break;
         case UI_RADIO:        drawRadio();       break;
@@ -1845,16 +1906,17 @@ void handleInput(BtnEvent evt) {
                 uiState=UI_HOME;
             } else if (evt==BTN_OK) {
                 switch (menuCursor) {
-                    case 0: uiState=UI_HOME;                                          break;
-                    case 1: uiState=UI_MODELS;    modelCursor=activeModel;            break;
-                    case 2: uiState=UI_CHANNELS;                                      break;
-                    case 3: uiState=UI_AXIS_REVERSE; settingCursor=0;                 break;
-                    case 4: uiState=UI_RATES;        settingCursor=0; settingEditMode=false; break;
-                    case 5: uiState=UI_RADIO;                                         break;
-                    case 6: uiState=UI_TELEMETRY;                                     break;
-                    case 7: uiState=UI_CALIBRATE; calibState=CALIB_IDLE;             break;
-                    case 8: uiState=UI_SETTINGS;  settingCursor=0; settingEditMode=false; break;
-                    case 9: uiState=UI_ABOUT;                                         break;
+                    case 0:  uiState=UI_HOME;                                                        break;
+                    case 1:  uiState=UI_MODELS;       modelCursor=activeModel;                     break;
+                    case 2:  uiState=UI_CHANNELS;                                                   break;
+                    case 3:  uiState=UI_CH_MAP;        settingCursor=0; settingEditMode=false;      break;
+                    case 4:  uiState=UI_AXIS_REVERSE;  settingCursor=0;                             break;
+                    case 5:  uiState=UI_RATES;         settingCursor=0; settingEditMode=false;      break;
+                    case 6:  uiState=UI_RADIO;                                                      break;
+                    case 7:  uiState=UI_TELEMETRY;                                                  break;
+                    case 8:  uiState=UI_CALIBRATE;     calibState=CALIB_IDLE;                      break;
+                    case 9:  uiState=UI_SETTINGS;      settingCursor=0; settingEditMode=false;      break;
+                    case 10: uiState=UI_ABOUT;                                                      break;
                 }
             }
             break;
@@ -1882,6 +1944,7 @@ void handleInput(BtnEvent evt) {
                     for (int i=0;i<4;i++){models[modelCursor].expo[i]=0;models[modelCursor].rate[i]=100;}
                     models[modelCursor].txFreqHz=50;
                     models[modelCursor].mixerType=MIXER_NONE;
+                    for (int i=0;i<10;i++) models[modelCursor].chRemap[i]=i;
                     if (activeModel==modelCursor) activeModel=0;
                     modelsSave(); beep(3,30,30);
                     downHeld=false;
@@ -2094,6 +2157,24 @@ void handleInput(BtnEvent evt) {
             }
             break;
 
+        case UI_CH_MAP: {
+            ModelProfile& cm = models[activeModel];
+            if (!settingEditMode) {
+                if (evt==BTN_UP)   settingCursor = (settingCursor + 9) % 10;
+                if (evt==BTN_DOWN) settingCursor = (settingCursor + 1) % 10;
+                if (evt==BTN_OK)   { settingEditMode=true; beep(1,30,0); }
+                if (evt==BTN_BACK) { modelSaveActive(); settingEditMode=false; uiState=UI_MENU; }
+            } else {
+                // Editing source for selected output slot
+                if (evt==BTN_UP || evt==BTN_RIGHT)
+                    cm.chRemap[settingCursor] = (cm.chRemap[settingCursor] + 1) % 10;
+                if (evt==BTN_DOWN)
+                    cm.chRemap[settingCursor] = (cm.chRemap[settingCursor] + 9) % 10;
+                if (evt==BTN_OK || evt==BTN_BACK) { settingEditMode=false; beep(1,30,0); }
+            }
+            break;
+        }
+
         case UI_TELEMETRY:
             if (evt==BTN_BACK || evt==BTN_OK) uiState=UI_MENU;
             break;
@@ -2101,6 +2182,54 @@ void handleInput(BtnEvent evt) {
         case UI_ABOUT:
             if (evt==BTN_BACK || evt==BTN_OK) uiState=UI_MENU;
             break;
+    }
+}
+
+// =============================================================================
+// RADIO TASK — Core 0
+// Handles all time-critical I/O: PCF8575 poll, ADC read, radio sends.
+// Pinned to Core 0 alongside the WiFi/ESP-NOW stack.
+// Priority 2 > loop()'s priority 1 — ensures radio timing is not delayed by
+// display rendering or USB HID calls on Core 1.
+// =============================================================================
+void radioTask(void* /*pvParams*/) {
+    uint32_t tInput = 0, tAdc = 0, tSend = 0;
+
+    for (;;) {
+        uint32_t now = millis();
+
+        // ── PCF8575 + switch channels — 100 Hz ───────────────────────────────
+        if (now - tInput >= 10) {
+            tInput = now;
+            pcfRead(); // I2C — no mutex (see sharedMux comment above)
+            xSemaphoreTake(sharedMux, portMAX_DELAY);
+            readSwitches();    // writes channels[4..7] from pcfCache
+            flightTimerTick(); // reads channels[6]
+            xSemaphoreGive(sharedMux);
+        }
+
+        // ── ADC gimbal/pot channels — 50 Hz ──────────────────────────────────
+        if (now - tAdc >= 20) {
+            tAdc = now;
+            xSemaphoreTake(sharedMux, portMAX_DELAY);
+            readAnalog();  // writes channels[0..3, 8, 9] + applies mixer
+            calibStep();   // no-op unless calibrating — tracks min/max
+            xSemaphoreGive(sharedMux);
+        }
+
+        // ── Radio send — at model txFreqHz (25/50/100 Hz) ────────────────────
+        uint32_t radioInterval = 1000 / models[activeModel].txFreqHz;
+        if (now - tSend >= radioInterval) {
+            tSend = now;
+            xSemaphoreTake(sharedMux, portMAX_DELAY);
+            if (radioMode == RADIO_NRF24)  nrfSend();
+            if (radioMode == RADIO_ESPNOW) espnowSend();
+            if (simModeOn)                 simSend();
+            xSemaphoreGive(sharedMux);
+            pairingTick(); // outside mutex — calls esp_now_send + beep()
+        }
+
+        vTaskDelay(1); // yield — lets WiFi/ESP-NOW stack on Core 0 run
     }
 }
 
@@ -2149,7 +2278,8 @@ void setup() {
 
     display = new U8G2_ST7565_ERC12864_ALT_F_4W_SW_SPI(U8G2_R0, PIN_SPI_SCK, PIN_SPI_MOSI, PIN_LCD_CS, PIN_LCD_DC, U8X8_PIN_NONE);
     display->begin();
-    display->setContrast(settings[0].value);
+    //display->setPowerSave(0);
+    display->setContrast(60);
     Serial.println("[INIT] Display OK");
 
     // Boot animation — expanding frame + title fade-in
@@ -2199,12 +2329,25 @@ void setup() {
     Serial.printf("[INIT] Ready — Model:%s  Radio:%s  Heap:%luKB\n",
         models[activeModel].name, radioModeName(),
         (unsigned long)(ESP.getFreeHeap()/1024));
+
+    // Launch radio task on Core 0 — must be last, after all peripherals are ready
+    sharedMux = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(
+        radioTask,  // function
+        "radio",    // task name
+        4096,       // stack bytes (ADC + I2C + SPI + ESP-NOW headroom)
+        nullptr,    // parameter
+        2,          // priority (higher than loop's 1 — radio timing takes precedence)
+        nullptr,    // handle (unused)
+        0           // Core 0 (alongside WiFi/ESP-NOW stack)
+    );
+    Serial.println("[INIT] Radio task started on Core 0");
 }
 
 // =============================================================================
 // LOOP
 // =============================================================================
-static uint32_t tInput=0, tRadio=0, tBattery=0, tRender=0, tDebug=0;
+static uint32_t tBattery=0, tRender=0, tDebug=0;
 
 void loop() {
     uint32_t now = millis();
@@ -2224,31 +2367,8 @@ void loop() {
         btnPending=BTN_NONE;
     }
 
-    // PCF8575 read at 100Hz (10ms) for snappy button response
-    if (now-tInput >= 10) {
-        tInput=now;
-        pcfRead();
-        readSwitches();
-        flightTimerTick(); // depends on fresh ARM channel state from readSwitches()
-    }
-
-    // ADC read at 50Hz (20ms) — no need to be faster
-    static uint32_t tAdc = 0;
-    if (now-tAdc >= 20) {
-        tAdc=now;
-        readAnalog();
-        calibStep(); // no-op unless calibrating — tracks min/max during calibration
-    }
-
-
-    uint32_t radioInterval = 1000 / models[activeModel].txFreqHz;
-    if (now-tRadio >= radioInterval) {
-        tRadio=now;
-        if (radioMode==RADIO_NRF24)  nrfSend();
-        if (radioMode==RADIO_ESPNOW) espnowSend();
-        if (simModeOn)               simSend();
-        pairingTick(); // sends PAIR_REQ when in searching state
-    }
+    // PCF8575 poll, ADC reads, and radio sends are handled by radioTask on Core 0.
+    // loop() on Core 1 handles UI, display, battery monitoring, and USB.
 
     if (now-tBattery >= 1100) {
         tBattery=now;
@@ -2327,10 +2447,14 @@ void loop() {
         wasLinked = isLinked;
     }
 
-    // 30fps render — SPI display is fast enough, no I2C bus conflict like SW_I2C
+    // 30fps render — guarded by sharedMux so radioTask doesn't write channels[]
+    // mid-frame. SW SPI sendBuffer takes ~1-2ms; radio task at 50Hz has 20ms
+    // per cycle so the brief block is well within timing budget.
     if (now-tRender >= 33) {
         tRender=now;
+        xSemaphoreTake(sharedMux, portMAX_DELAY);
         renderFrame();
+        xSemaphoreGive(sharedMux);
         pollButtons(); // catch input during render to keep menu snappy
         if (btnPending != BTN_NONE) {
             if (dimmed) { ledcWrite(PIN_LCD_BL, settings[1].value); dimmed=false; }
@@ -2344,9 +2468,11 @@ void loop() {
 
     if (now-tDebug >= 5000) {
         tDebug=now;
-        const char* s[]={"HOME","MENU","MDL","CH","RADIO","CAL","SET","ABOUT"};
+        // Array must match UiState enum order exactly (14 entries, 0-13)
+        const char* s[]={"HOME","MENU","MDL","MDL_EDIT","CH","CH_MAP","AX_REV","RATES","RADIO","PAIR","CAL","SET","TELEM","ABOUT"};
         Serial.printf("[WD] UI:%s  %.2fV %d%%  LQ:%d%%  %s  Model:%s  Heap:%luKB\n",
-            s[uiState],battVoltage,battPercent(),
+            (uiState < sizeof(s)/sizeof(s[0])) ? s[uiState] : "?",
+            battVoltage,battPercent(),
             linkQuality,radioModeName(),models[activeModel].name,
             (unsigned long)(ESP.getFreeHeap()/1024));
     }
